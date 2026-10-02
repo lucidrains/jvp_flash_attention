@@ -535,6 +535,7 @@ If you use the code associated with this package or otherwise find this work use
 ## Demonstrated use cases
 
 - [EchoLVFM (MICCAI 2026)](https://github.com/EngEmmanuel/EchoLVFM)
+- [Self-Play Pretraining with Zero Data (arXiv 2026)](https://arxiv.org/abs/2609.30063)
 
 ## Acknowledgements
 
