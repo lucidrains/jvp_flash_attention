@@ -27,16 +27,64 @@ from typing import Any, Literal, NamedTuple
 
 import torch
 import torch.autograd.forward_ad as fwAD
-import triton
-import triton.language as tl
 from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
+
+from .naive_pytorch import (
+    MASK_CONST,
+    MIN_SEQUENCE_LENGTH,
+    exists,
+    prepare_attn_mask,
+    tiled_attention,
+    tiled_attention_backward,
+)
 
 # NOTE: Uncomment to turn warnings into errors for debugging
 # import warnings
 # warnings.filterwarnings("error", category=UserWarning)
 # warnings.filterwarnings("error", category=RuntimeWarning)
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+    class _TritonConfig(NamedTuple):
+        """Minimal stand-in for `triton.Config`."""
+
+        kwargs: dict[str, Any]
+        num_stages: int = 3
+        num_warps: int = 4
+        pre_hook: Any = None
+
+    class _TritonStub:
+        """Minimal stand-in for the `triton` module, allowing import without Triton."""
+
+        Config = _TritonConfig
+
+        @staticmethod
+        def jit(fn=None, **kwargs):
+            """Return the decorated function unchanged."""
+            if fn is None:
+                return lambda f: f
+            return fn
+
+        @staticmethod
+        def cdiv(x: int, y: int) -> int:
+            """Ceiling division."""
+            return -(-x // y)
+
+        @staticmethod
+        def set_allocator(*args, **kwargs) -> None:
+            """No-op stand-in for `triton.set_allocator`."""
+            return None
+
+    triton = _TritonStub()
+    tl = _TritonStub()
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -45,10 +93,37 @@ try:
 except ModuleNotFoundError:
     HAS_TENSOR_DESC = False
 
-MASK_CONST = (
-    -1.0e2
-)  # Use a large negative value for masking (compatible with float16, bfloat16, and float32)
-MIN_SEQUENCE_LENGTH = 32  # NOTE: All sequence lengths must be multiples of 2 >= 32
+
+def use_naive_attention(
+    device: torch.device | str | Tensor, USE_NAIVE: bool | None = None
+) -> bool:
+    """Whether to use the pure-PyTorch tiled attention instead of the Triton kernels.
+
+    Args:
+        device: The device (or a tensor on the device) the attention will run on.
+        USE_NAIVE: Whether to force the pure-PyTorch implementation (True), force the
+            Triton kernels (False), or choose automatically (None).
+
+    Returns:
+        True if the pure-PyTorch implementation should be used, otherwise False.
+    """
+    assert not exists(USE_NAIVE) or isinstance(USE_NAIVE, bool), (
+        f"USE_NAIVE must be None, True, or False, but got {USE_NAIVE!r}"
+    )
+    if isinstance(device, Tensor):
+        device = device.device
+    device = torch.device(device)
+
+    if exists(USE_NAIVE):
+        assert USE_NAIVE or (HAS_TRITON and device.type == "cuda" and torch.cuda.is_available()), (
+            "Cannot force the Triton backend (USE_NAIVE=False) because "
+            f"Triton is {'installed' if HAS_TRITON else 'not installed'}, "
+            f"CUDA is {'available' if torch.cuda.is_available() else 'unavailable'}, and the "
+            f"device is {device!r}; pass USE_NAIVE=True or USE_NAIVE=None instead."
+        )
+        return USE_NAIVE
+
+    return not HAS_TRITON or device.type != "cuda"
 
 
 def is_hip():
@@ -2492,6 +2567,7 @@ class JVPAttn(Function):
         warp_specialize: None
         USE_TMA: None
         verify_attn_mask: None
+        USE_NAIVE: None
 
     class Strides(NamedTuple):
         """Strides for JVP Attention."""
@@ -2516,6 +2592,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        USE_NAIVE: bool | None = None,
     ) -> JVPAttn.FwdOut:
         """Forward pass for JVP Attention.
 
@@ -2543,6 +2620,8 @@ class JVPAttn(Function):
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False)
+                implementation, or to choose automatically (None).
 
         Returns:
             Outputs of JVP Attention.
@@ -2573,21 +2652,42 @@ class JVPAttn(Function):
 
         if causal and attn_mask is not None:
             raise ValueError("Causal attention does not support an attention mask.")
-        if attn_mask is not None and verify_attn_mask:
-            assert attn_mask.shape == (
-                Z,
-                H,
-                N_CTX,
-                N_CTX,
-            ), "The provided attention mask must have 4 dimensions (Z, H, N_CTX, N_CTX)."
-            assert attn_mask.dtype in {
-                torch.bool,
-                q.dtype,
-            }, "The attention mask must be of the dtype bool or that of the query tensor."
 
         # Initialize arguments and tensors
         if sm_scale is None:
             sm_scale = HEAD_DIM_K**-0.5
+
+        # pure pytorch fallback (no triton / cuda)
+        mask_tensor, MASK_TYPE = prepare_attn_mask(attn_mask, q, verify_attn_mask)
+        if use_naive_attention(q, USE_NAIVE):
+            o, o_t, M = tiled_attention(
+                q,
+                k,
+                v,
+                mask_tensor,
+                MASK_TYPE,
+                causal,
+                sm_scale,
+                q_t,
+                k_t,
+                v_t,
+            )
+
+            return (  # was JVPAttn.FwdOut
+                o,
+                (  # was JVPAttn.FwdOutCtxContrib
+                    o_t,
+                    M,
+                    None,
+                    HEAD_DIM_K,
+                    sm_scale,
+                    mask_tensor,
+                    MASK_TYPE,
+                    dropout_p,
+                    0,
+                    False,
+                ),
+            )
 
         o = torch.empty_like(q)
         o_t: Tensor | None = torch.empty_like(q_t) if ENABLE_JVP else None
@@ -2620,40 +2720,8 @@ class JVPAttn(Function):
             """Get strides for a tensor with shape (Z, H, N_CTX, HEAD_DIM)."""
             return (t.stride(0), t.stride(1), t.stride(2), t.stride(3))  # was JVPAttn.Strides
 
-        # Determine mask type
-        if attn_mask is None:
-            MASK_TYPE = 0
-            mask_tensor = torch.empty(0, device=q.device, dtype=q.dtype)
-            mask_strides = (0, 0, 0, 0)
-        elif attn_mask.dtype == torch.bool:
-            MASK_TYPE = 1
-            mask_tensor = attn_mask.contiguous()
-            mask_strides = strides_zhnd(mask_tensor)
-            if verify_attn_mask:
-                # Check if any head is all False
-                assert mask_tensor.any(
-                    dim=(-1, -2)
-                ).all(), "The attention mask cannot be all False for any head."
-        else:
-            MASK_TYPE = 2
-            mask_tensor = attn_mask.to(q.dtype).contiguous()
-            mask_strides = strides_zhnd(mask_tensor)
-            if verify_attn_mask:
-                # Check if the mask contains -inf/inf/NaN or is all (or no) MASK_CONST for any head
-                assert not torch.isinf(
-                    mask_tensor
-                ).any(), "The attention mask cannot contain -inf or inf."
-                assert not torch.isnan(
-                    mask_tensor
-                ).any(), "The attention mask cannot contain NaNs."
-                assert (
-                    (mask_tensor != MASK_CONST).any(dim=(-1, -2)).all()
-                ), f"The attention mask cannot be all {MASK_CONST} (the masking constant) for any head."
-
-                if not (mask_tensor == MASK_CONST).any():
-                    raise UserWarning(
-                        f"The provided floating-point attention mask does not mask out any elements with {MASK_CONST} (the masking constant). Consider using this constant for correct masking behavior."
-                    )
+        # Determine stride configuration for the mask tensor
+        mask_strides = (0, 0, 0, 0) if MASK_TYPE == 0 else strides_zhnd(mask_tensor)
 
         # Prepare dropout arguments
         ENABLE_DROPOUT = dropout_p > 0.0
@@ -2884,6 +2952,7 @@ class JVPAttn(Function):
             warp_specialize,
             USE_TMA,
             verify_attn_mask,
+            USE_NAIVE,
         ) = inputs
 
         o, (
@@ -2899,6 +2968,7 @@ class JVPAttn(Function):
             ENABLE_DROPOUT,
         ) = outputs
 
+        ctx.use_naive = use_naive_attention(q, USE_NAIVE)
         ctx.grid = grid
         ctx.save_for_forward(o_t)
         ctx.save_for_backward(q, k, v, o, M)
@@ -2924,6 +2994,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        USE_NAIVE: bool | None = None,
     ) -> Tensor:
         """Forward pass for JVP Attention.
 
@@ -2943,6 +3014,7 @@ class JVPAttn(Function):
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False) implementation, or to choose automatically (None).
 
         Returns:
             The output tensor.
@@ -2964,6 +3036,7 @@ class JVPAttn(Function):
             warp_specialize,
             USE_TMA,
             verify_attn_mask,
+            USE_NAIVE,
         )
 
         a, _ = out
@@ -2981,6 +3054,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        USE_NAIVE: bool | None = None,
     ) -> Tensor:
         """Forward pass for JVP Attention with dual tensor inputs.
 
@@ -3000,6 +3074,7 @@ class JVPAttn(Function):
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False) implementation, or to choose automatically (None).
 
         Returns:
             The output tensor.
@@ -3037,6 +3112,7 @@ class JVPAttn(Function):
                 warp_specialize,
                 USE_TMA,
                 verify_attn_mask,
+                USE_NAIVE,
             )
             return fwAD.make_dual(o, o_t)
 
@@ -3057,6 +3133,7 @@ class JVPAttn(Function):
             warp_specialize,
             USE_TMA,
             verify_attn_mask,
+            USE_NAIVE,
         )
 
         a, _ = out
@@ -3103,6 +3180,38 @@ class JVPAttn(Function):
             ):
                 return torch._C._functorch.get_unwrapped(x)
             return x
+
+        # pure pytorch backward (no triton / cuda)
+        if ctx.use_naive:
+            dq, dk, dv = tiled_attention_backward(
+                q,
+                k,
+                v,
+                o,
+                do,
+                M,
+                ctx.mask_tensor,
+                ctx.MASK_TYPE,
+                ctx.causal,
+                ctx.sm_scale,
+            )
+
+            return (  # was JVPAttn.BwdOut
+                dq,
+                dk,
+                dv,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         # Ensure inputs/outputs the kernel reads share the same (contiguous) layout
         if not (
@@ -3223,7 +3332,22 @@ class JVPAttn(Function):
             num_warps=4,  #
         )
 
-        return (dq, dk, dv, None, None, None, None, None, None, None, None, None, None)  # was JVPAttn.BwdOut
+        return (  # was JVPAttn.BwdOut
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 attention = JVPAttn.fwd
