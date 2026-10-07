@@ -27,18 +27,22 @@ from typing import Any, Literal, NamedTuple
 
 import torch
 import torch.autograd.forward_ad as fwAD
+import torch.nn.functional as F
 from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
 
 from .naive_pytorch import (
     MASK_CONST,
-    MIN_SEQUENCE_LENGTH,
     exists,
     prepare_attn_mask,
     tiled_attention,
     tiled_attention_backward,
 )
+
+# NOTE: The Triton kernels require the sequence length to be a multiple of this
+# value (and at least this large); short or mismatched sequences are padded up.
+MIN_SEQUENCE_LENGTH = 32
 
 # NOTE: Uncomment to turn warnings into errors for debugging
 # import warnings
@@ -107,9 +111,9 @@ def use_naive_attention(
     Returns:
         True if the pure-PyTorch implementation should be used, otherwise False.
     """
-    assert not exists(USE_NAIVE) or isinstance(USE_NAIVE, bool), (
-        f"USE_NAIVE must be None, True, or False, but got {USE_NAIVE!r}"
-    )
+    assert not exists(USE_NAIVE) or isinstance(
+        USE_NAIVE, bool
+    ), f"USE_NAIVE must be None, True, or False, but got {USE_NAIVE!r}"
     if isinstance(device, Tensor):
         device = device.device
     device = torch.device(device)
@@ -175,6 +179,62 @@ def _is_compiling() -> bool:
             return torch._dynamo.is_compiling()
         except Exception:
             return False
+
+
+# padding function
+def pad_to_length(t: Tensor, length: int, left: bool = False) -> Tensor:
+    """-> (..., length, head_dim), zero-padding the sequence dimension of `t`."""
+    pad = length - t.shape[-2]
+    if pad <= 0:
+        return t
+    return F.pad(t, (0, 0, pad, 0) if left else (0, 0, 0, pad))
+
+
+def min_padded_length(seq_len: int, min_sequence_length: int = MIN_SEQUENCE_LENGTH) -> int:
+    """-> the smallest multiple of min_sequence_length that is >= seq_len."""
+    return (
+        (seq_len + min_sequence_length - 1) // min_sequence_length
+    ) * min_sequence_length
+
+
+def pad_mode_for(
+    n_q: int, n_kv: int, has_mask: bool, min_sequence_length: int = MIN_SEQUENCE_LENGTH
+) -> str | None:
+    """-> "left", "right", or None, depending on whether/where padding is needed."""
+    needs_pad = (
+        n_q != n_kv or n_q < min_sequence_length or n_q % min_sequence_length != 0
+    )
+    if not needs_pad:
+        return None
+    return "right" if has_mask else "left"
+
+
+def build_internal_mask(
+    n_q: int, n_kv: int, length: int, causal: bool, device: torch.device
+) -> Tensor:
+    """-> (length, length) boolean mask for left-padded, query-as-tail attention."""
+    row = torch.arange(length, device=device)
+    col = torch.arange(length, device=device)
+    keep = (row >= length - n_q)[:, None] & (col >= length - n_kv)[None, :]
+    if causal:
+        keep = keep & (row[:, None] >= col[None, :])
+    return keep
+
+
+def pad_attn_mask(mask_tensor: Tensor, mask_type: int, length: int) -> Tensor:
+    """-> (..., length, length) mask, masking out padded keys/values."""
+    pad = length - mask_tensor.shape[-1]
+    if pad <= 0:
+        return mask_tensor
+    value: bool | float = False if mask_type == 1 else MASK_CONST
+    return F.pad(mask_tensor, (0, pad, 0, pad), value=value)
+
+
+def excise_padding(t: Tensor, n: int, pad_mode: str | None) -> Tensor:
+    """-> (..., n, head_dim), dropping the padded rows from `t`."""
+    if pad_mode is None:
+        return t
+    return t[..., -n:, :] if pad_mode == "left" else t[..., :n, :]
 
 
 @triton.jit
@@ -401,11 +461,11 @@ def _attn_fwd_inner(
             mu_ij = tl.sum(p_tqk, 1)
             mu_i = mu_i * alpha + mu_ij
             t_v = tl.load(T_V_block_ptr)
-            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p, t_v.to(dtype)).to(t_v.dtype)
+            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p.to(t_v.dtype), t_v).to(t_v.dtype)
             T_V_block_ptr = tl.advance(T_V_block_ptr, (BLOCK_N, 0))
             T_K_block_ptr = tl.advance(T_K_block_ptr, (0, BLOCK_N))
 
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        acc = tl.dot(p.to(v.dtype), v, acc).to(acc.dtype)
 
         # -- Update m_i --
         m_i = m_ij
@@ -616,10 +676,10 @@ def _attn_fwd_inner_tma(
             mu_ij = tl.sum(p_tqk, 1)
             mu_i = mu_i * alpha + mu_ij
             t_v = desc_v_t.load([offsetv_y, 0])
-            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p, t_v.to(dtype)).to(t_v.dtype)
+            p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p.to(t_v.dtype), t_v).to(t_v.dtype)
 
         # NOTE: This non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        acc = tl.dot(p.to(v.dtype), v, acc).to(acc.dtype)
 
         # Update m_i and l_i
         # Place this at the end of the loop to reduce register pressure
@@ -1583,7 +1643,10 @@ def _attn_bwd_dkdv(
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
-    dtype = tl.float32  # For dot products
+    # Compute fp8 gradients in fp32; other dtypes keep their tensor cores
+    dot_dtype: tl.constexpr = (
+        tl.float32 if do_ptrs.dtype.element_ty == tl.float8e5 else do_ptrs.dtype.element_ty
+    )
 
     # Iteratively compute dK and dV over the M dimension
     for _ in range(num_steps):
@@ -1622,9 +1685,8 @@ def _attn_bwd_dkdv(
 
         # Compute dV
         ppT = pT
-        ppT = ppT.to(dtype)
         do = tl.load(do_ptrs)
-        dv += tl.dot(ppT, do.to(dtype)).to(do.dtype)
+        dv += tl.dot(ppT.to(dot_dtype), do.to(dot_dtype)).to(do.dtype)
         # NOTE: D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
 
@@ -1635,8 +1697,7 @@ def _attn_bwd_dkdv(
             dpT = dpT * dropout_mask.to(dpT.dtype) * dropout_scale
 
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(dtype)
-        dk += tl.dot(dsT, tl.trans(qT).to(dtype)).to(qT.dtype)
+        dk += tl.dot(dsT.to(dot_dtype), tl.trans(qT).to(dot_dtype)).to(qT.dtype)
 
         # Increment pointers
         curr_m += step_m
@@ -1735,7 +1796,10 @@ def _attn_bwd_dq(
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
     step_n = BLOCK_N2
-    dtype = tl.float32  # For dot products
+    # Compute fp8 gradients in fp32; other dtypes keep their tensor cores
+    dot_dtype: tl.constexpr = (
+        tl.float32 if kT_ptrs.dtype.element_ty == tl.float8e5 else kT_ptrs.dtype.element_ty
+    )
 
     # Iteratively compute dQ over the N dimension
     for _ in range(num_steps):
@@ -1779,8 +1843,7 @@ def _attn_bwd_dq(
 
         # Compute dQ
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        ds = ds.to(dtype)
-        dq += tl.dot(ds, tl.trans(kT).to(dtype)).to(kT.dtype)
+        dq += tl.dot(ds.to(dot_dtype), tl.trans(kT).to(dot_dtype)).to(kT.dtype)
 
         # Increment pointers
         curr_n += step_n
@@ -2334,10 +2397,10 @@ def _attn_fwd_dual_triton(
     causal: bool,
     warp_specialize: bool,
     mask_type: int,
+    min_sequence_length: int = MIN_SEQUENCE_LENGTH,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Opaque custom op wrapper for the dual Triton forward launch used under torch.compile.
-    
+    """Opaque custom op wrapper for the dual Triton forward launch used under torch.compile.
+
     Args:
         q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
         k: Key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
@@ -2353,6 +2416,7 @@ def _attn_fwd_dual_triton(
         warp_specialize: Whether to enable warp specialization in the Triton kernel.
         mask_type: Type of masking (0: no mask, 1: boolean mask,
                         2: additive mask).
+        min_sequence_length: Minimum block size for the kernels; see `JVPAttn.forward`.
 
     Returns:
         A tuple containing:
@@ -2442,8 +2506,8 @@ def _attn_fwd_dual_triton(
         ENABLE_DROPOUT=ENABLE_DROPOUT,
         MASK_TYPE=mask_type,
         # NOTE: The following are safe (unit-tested) default values
-        BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-        BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+        BLOCK_M=min_sequence_length,  #
+        BLOCK_N=min_sequence_length,  #
         num_stages=NUM_STAGES_OPTIONS[0],  #
         num_warps=4,  #
         **extra_kern_args,
@@ -2466,11 +2530,11 @@ def _attn_fwd_dual_triton_fake(
     causal: bool,
     warp_specialize: bool,
     mask_type: int,
+    min_sequence_length: int = MIN_SEQUENCE_LENGTH,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Fake implementation of the dual Triton forward launch for compilation purposes.
-    This implementation does not perform any actual computation and returns
-    empty tensors with the appropriate shapes.
+    """Fake implementation of the dual Triton forward launch for compilation purposes. This
+    implementation does not perform any actual computation and returns empty tensors with the
+    appropriate shapes.
 
     Args:
         q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
@@ -2487,6 +2551,7 @@ def _attn_fwd_dual_triton_fake(
         warp_specialize: Whether to enable warp specialization in the Triton kernel.
         mask_type: Type of masking (0: no mask, 1: boolean mask,
                         2: additive mask).
+        min_sequence_length: Minimum block size for the kernels; see `JVPAttn.forward`.
 
     Returns:
         A tuple containing:
@@ -2524,6 +2589,7 @@ class JVPAttn(Function):
         dropout_p: float
         philox_seed: int
         ENABLE_DROPOUT: bool
+        min_sequence_length: int
 
     class FwdOutCtxContrib(NamedTuple):
         """Forward output context contributions for JVP Attention."""
@@ -2538,6 +2604,9 @@ class JVPAttn(Function):
         dropout_p: float
         philox_seed: int
         ENABLE_DROPOUT: bool
+        n_q: int
+        n_kv: int
+        pad_mode: str | None
 
     class FwdOut(NamedTuple):
         """Forward output for JVP Attention."""
@@ -2568,6 +2637,7 @@ class JVPAttn(Function):
         USE_TMA: None
         verify_attn_mask: None
         USE_NAIVE: None
+        min_sequence_length: None
 
     class Strides(NamedTuple):
         """Strides for JVP Attention."""
@@ -2593,6 +2663,7 @@ class JVPAttn(Function):
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
         USE_NAIVE: bool | None = None,
+        min_sequence_length: int = MIN_SEQUENCE_LENGTH,
     ) -> JVPAttn.FwdOut:
         """Forward pass for JVP Attention.
 
@@ -2622,6 +2693,9 @@ class JVPAttn(Function):
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
             USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False)
                 implementation, or to choose automatically (None).
+            min_sequence_length: The block size (and minimum sequence length) used
+                by the Triton kernels; shorter or non-multiple sequence lengths
+                are padded internally.
 
         Returns:
             Outputs of JVP Attention.
@@ -2631,6 +2705,8 @@ class JVPAttn(Function):
 
         # Collect metadata
         Z, H, N_CTX, HEAD_DIM_Q = q.shape
+        n_q = N_CTX
+        n_kv = k.shape[2]
         HEAD_DIM_K = k.shape[-1]
         HEAD_DIM_V = v.shape[-1]  # NOTE: When v is in float8_e5m2 it is transposed.
 
@@ -2645,10 +2721,14 @@ class JVPAttn(Function):
             "JVP attention only supports HEAD_DIM_K in {16, 32, 64, 128, 256},"
             f" but got HEAD_DIM_K={HEAD_DIM_K}",
         )
-        assert N_CTX % 2 == 0 and N_CTX >= 32, (
-            "JVP attention requires N_CTX to be a multiple of 2 and >= 32,"
-            f" but got N_CTX={N_CTX}",
-        )
+        assert (
+            n_kv >= n_q
+        ), f"JVP attention requires key length >= query length, but got {n_kv} and {n_q}"
+        if attn_mask is not None:
+            assert n_kv == n_q, (
+                "JVP attention requires q and k to have the same sequence length when an"
+                f" attention mask is provided, but got {n_q} and {n_kv}"
+            )
 
         if causal and attn_mask is not None:
             raise ValueError("Causal attention does not support an attention mask.")
@@ -2657,7 +2737,7 @@ class JVPAttn(Function):
         if sm_scale is None:
             sm_scale = HEAD_DIM_K**-0.5
 
-        # pure pytorch fallback (no triton / cuda)
+        # pure pytorch fallback (no triton / cuda); handles any sequence length natively
         mask_tensor, MASK_TYPE = prepare_attn_mask(attn_mask, q, verify_attn_mask)
         if use_naive_attention(q, USE_NAIVE):
             o, o_t, M = tiled_attention(
@@ -2675,7 +2755,7 @@ class JVPAttn(Function):
 
             return (  # was JVPAttn.FwdOut
                 o,
-                (  # was JVPAttn.FwdOutCtxContrib
+                JVPAttn.FwdOutCtxContrib(  # was JVPAttn.FwdOutCtxContrib
                     o_t,
                     M,
                     None,
@@ -2686,8 +2766,36 @@ class JVPAttn(Function):
                     dropout_p,
                     0,
                     False,
+                    n_q,
+                    n_kv,
+                    None,
                 ),
             )
+
+        # NOTE: The Triton kernels require the sequence length to be at least
+        # min_sequence_length and a multiple of it; short (or mismatched) sequences are
+        # padded up and the padding is excised from the outputs afterwards.
+        pad_mode = pad_mode_for(n_q, n_kv, attn_mask is not None, min_sequence_length)
+        if pad_mode is not None:
+            left = pad_mode == "left"
+            N_CTX = min_padded_length(max(n_q, n_kv), min_sequence_length)
+            q = pad_to_length(q, N_CTX, left=left)
+            k = pad_to_length(k, N_CTX, left=left)
+            v = pad_to_length(v, N_CTX, left=left)
+            if ENABLE_JVP:
+                q_t = pad_to_length(q_t, N_CTX, left=left)
+                k_t = pad_to_length(k_t, N_CTX, left=left)
+                v_t = pad_to_length(v_t, N_CTX, left=left)
+
+            if left:
+                # Encode the (optionally causal) query-as-tail alignment in a boolean mask.
+                mask_tensor = build_internal_mask(n_q, n_kv, N_CTX, causal, q.device)
+                mask_tensor = mask_tensor.expand(Z, H, N_CTX, N_CTX).contiguous()
+                MASK_TYPE = 1
+                causal = False
+                STAGE = 1
+            else:
+                mask_tensor = pad_attn_mask(mask_tensor, MASK_TYPE, N_CTX)
 
         o = torch.empty_like(q)
         o_t: Tensor | None = torch.empty_like(q_t) if ENABLE_JVP else None
@@ -2757,11 +2865,12 @@ class JVPAttn(Function):
                     causal,
                     warp_specialize,
                     MASK_TYPE,
+                    min_sequence_length,
                 )
         elif USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
-            tma_block_shape = [MIN_SEQUENCE_LENGTH, HEAD_DIM_K]
+            tma_block_shape = [min_sequence_length, HEAD_DIM_K]
 
             desc_q = TensorDescriptor(
                 q,
@@ -2864,8 +2973,8 @@ class JVPAttn(Function):
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
                 # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=min_sequence_length,  #
+                BLOCK_N=min_sequence_length,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
@@ -2906,8 +3015,8 @@ class JVPAttn(Function):
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 MASK_TYPE=MASK_TYPE,
                 # NOTE: The following are safe (unit-tested) default values
-                BLOCK_M=MIN_SEQUENCE_LENGTH,  #
-                BLOCK_N=MIN_SEQUENCE_LENGTH,  #
+                BLOCK_M=min_sequence_length,  #
+                BLOCK_N=min_sequence_length,  #
                 num_stages=NUM_STAGES_OPTIONS[0],  #
                 num_warps=4,  #
                 **extra_kern_args,
@@ -2915,7 +3024,7 @@ class JVPAttn(Function):
 
         return (  # was JVPAttn.FwdOut
             o,
-            (  # was JVPAttn.FwdOutCtxContrib
+            JVPAttn.FwdOutCtxContrib(  # was JVPAttn.FwdOutCtxContrib
                 o_t,
                 M,
                 grid,
@@ -2926,6 +3035,9 @@ class JVPAttn(Function):
                 dropout_p,
                 philox_seed,
                 ENABLE_DROPOUT,
+                n_q,
+                n_kv,
+                pad_mode,
             ),
         )
 
@@ -2953,6 +3065,7 @@ class JVPAttn(Function):
             USE_TMA,
             verify_attn_mask,
             USE_NAIVE,
+            min_sequence_length,
         ) = inputs
 
         o, (
@@ -2966,6 +3079,9 @@ class JVPAttn(Function):
             dropout_p,
             philox_seed,
             ENABLE_DROPOUT,
+            n_q,
+            n_kv,
+            pad_mode,
         ) = outputs
 
         ctx.use_naive = use_naive_attention(q, USE_NAIVE)
@@ -2975,12 +3091,18 @@ class JVPAttn(Function):
 
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM_K = HEAD_DIM_K
-        ctx.causal = causal
+        # NOTE: For padded pathways, causality is encoded in the mask itself, so the
+        # backward pass must run the (mask-driven) non-causal kernel.
+        ctx.causal = causal if pad_mode is None else False
         ctx.mask_tensor = mask_tensor
         ctx.MASK_TYPE = MASK_TYPE
         ctx.dropout_p = dropout_p
         ctx.philox_seed = philox_seed
         ctx.ENABLE_DROPOUT = ENABLE_DROPOUT
+        ctx.min_sequence_length = min_sequence_length
+        ctx.n_q = n_q
+        ctx.n_kv = n_kv
+        ctx.pad_mode = pad_mode
 
     @staticmethod
     def fwd(
@@ -2995,6 +3117,7 @@ class JVPAttn(Function):
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
         USE_NAIVE: bool | None = None,
+        min_sequence_length: int = MIN_SEQUENCE_LENGTH,
     ) -> Tensor:
         """Forward pass for JVP Attention.
 
@@ -3015,6 +3138,9 @@ class JVPAttn(Function):
             USE_TMA: Whether to use TMA.
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
             USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False) implementation, or to choose automatically (None).
+            min_sequence_length: The block size (and minimum sequence length) used
+                by the Triton kernels; shorter or non-multiple sequence lengths
+                are padded internally.
 
         Returns:
             The output tensor.
@@ -3037,10 +3163,11 @@ class JVPAttn(Function):
             USE_TMA,
             verify_attn_mask,
             USE_NAIVE,
+            min_sequence_length,
         )
 
-        a, _ = out
-        return a
+        a, ctx_contrib = out
+        return excise_padding(a, ctx_contrib.n_q, ctx_contrib.pad_mode)
 
     @staticmethod
     def fwd_dual(
@@ -3055,6 +3182,7 @@ class JVPAttn(Function):
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
         USE_NAIVE: bool | None = None,
+        min_sequence_length: int = MIN_SEQUENCE_LENGTH,
     ) -> Tensor:
         """Forward pass for JVP Attention with dual tensor inputs.
 
@@ -3075,6 +3203,9 @@ class JVPAttn(Function):
             USE_TMA: Whether to use TMA.
             verify_attn_mask: Whether to verify the correctness of the provided attention mask.
             USE_NAIVE: Whether to force the pure-PyTorch (True) or Triton (False) implementation, or to choose automatically (None).
+            min_sequence_length: The block size (and minimum sequence length) used
+                by the Triton kernels; shorter or non-multiple sequence lengths
+                are padded internally.
 
         Returns:
             The output tensor.
@@ -3087,18 +3218,7 @@ class JVPAttn(Function):
         v_p, v_t = fwAD.unpack_dual(v)
 
         if _is_compiling() and q_t is not None and k_t is not None and v_t is not None:
-            o, (
-                o_t,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-            ) = JVPAttn.forward(
+            o, ctx_contrib = JVPAttn.forward(
                 q_p,
                 k_p,
                 v_p,
@@ -3113,6 +3233,13 @@ class JVPAttn(Function):
                 USE_TMA,
                 verify_attn_mask,
                 USE_NAIVE,
+                min_sequence_length,
+            )
+            o = excise_padding(o, ctx_contrib.n_q, ctx_contrib.pad_mode)
+            o_t = (
+                None
+                if ctx_contrib.o_t is None
+                else excise_padding(ctx_contrib.o_t, ctx_contrib.n_q, ctx_contrib.pad_mode)
             )
             return fwAD.make_dual(o, o_t)
 
@@ -3134,10 +3261,11 @@ class JVPAttn(Function):
             USE_TMA,
             verify_attn_mask,
             USE_NAIVE,
+            min_sequence_length,
         )
 
-        a, _ = out
-        return a
+        a, ctx_contrib = out
+        return excise_padding(a, ctx_contrib.n_q, ctx_contrib.pad_mode)
 
     @staticmethod
     def jvp(ctx: JVPAttn.FnCtx, gq: Tensor, gk: Tensor, gv: Tensor, *_) -> JVPAttn.JVPOut:
@@ -3211,7 +3339,18 @@ class JVPAttn(Function):
                 None,
                 None,
                 None,
+                None,
             )
+
+        # NOTE: For padded pathways, restore the padded layout the kernels expect.
+        if ctx.pad_mode is not None:
+            left = ctx.pad_mode == "left"
+            length = M.shape[-1]
+            q = pad_to_length(unwrap(q), length, left=left)
+            k = pad_to_length(unwrap(k), length, left=left)
+            v = pad_to_length(unwrap(v), length, left=left)
+            o = pad_to_length(unwrap(o), length, left=left)
+            do = pad_to_length(unwrap(do), length, left=left)
 
         # Ensure inputs/outputs the kernel reads share the same (contiguous) layout
         if not (
@@ -3245,7 +3384,7 @@ class JVPAttn(Function):
         Z, H, N_CTX = q.shape[:3]
 
         BLK_SLICE_FACTOR = 2  # NOTE: This is a safe default value to reduce backward memory usage
-        BLOCK_MIN = MIN_SEQUENCE_LENGTH  # NOTE: Adjust according to minimum input sequence length
+        BLOCK_MIN = ctx.min_sequence_length
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = BLOCK_MIN, BLOCK_MIN, BLOCK_MIN, BLOCK_MIN
 
         assert N_CTX % BLOCK_MIN == 0, f"N_CTX must be divisible by BLOCK_MIN={BLOCK_MIN}"
@@ -3333,9 +3472,10 @@ class JVPAttn(Function):
         )
 
         return (  # was JVPAttn.BwdOut
-            dq,
-            dk,
-            dv,
+            excise_padding(dq, ctx.n_q, ctx.pad_mode),
+            excise_padding(dk, ctx.n_kv, ctx.pad_mode),
+            excise_padding(dv, ctx.n_kv, ctx.pad_mode),
+            None,
             None,
             None,
             None,

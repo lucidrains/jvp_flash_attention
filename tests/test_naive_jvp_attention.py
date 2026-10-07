@@ -109,12 +109,16 @@ def sdpa_dual_reference(
 
 
 def assert_close_metrics(
-    got: tuple[Tensor, ...], expected: tuple[Tensor, ...], dtype: torch.dtype
+    got: tuple[Tensor, ...],
+    expected: tuple[Tensor, ...],
+    dtype: torch.dtype,
+    atol: float | None = None,
 ) -> None:
     """Compare primal/tangent/gradient tensors with dtype-appropriate tolerances."""
 
+    tol = ATOL[dtype] if atol is None else atol
     for actual, desired in zip(got, expected):
-        torch.testing.assert_close(actual, desired, atol=ATOL[dtype], rtol=RTOL)
+        torch.testing.assert_close(actual, desired, atol=tol, rtol=RTOL)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -131,7 +135,7 @@ def test_fwd_matches_sdpa(dtype: torch.dtype, mask_kind: str | None, causal: boo
         ((ref - target) ** 2).mean().backward()
 
     q, k, v = (t.clone().requires_grad_() for t in (q_p, k_p, v_p))
-    out = JVPAttn.fwd(q, k, v, attn_mask=mask, causal=causal)
+    out = JVPAttn.fwd(q, k, v, attn_mask=mask, causal=causal, USE_NAIVE=True)
     ((out - target) ** 2).mean().backward()
 
     assert_close_metrics(
@@ -143,8 +147,10 @@ def test_fwd_matches_sdpa(dtype: torch.dtype, mask_kind: str | None, causal: boo
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("mask_kind,causal", MASK_CASES)
-def test_fwd_dual_matches_sdpa(dtype: torch.dtype, mask_kind: str | None, causal: bool) -> None:
-    """The naive `fwd_dual` primal, tangent, and gradients match SDPA's."""
+def test_jvp_interfaces_match_sdpa(
+    dtype: torch.dtype, mask_kind: str | None, causal: bool
+) -> None:
+    """`fwd_dual` and `torch.func.jvp` both match SDPA's primal, tangent, and gradients."""
 
     q_p, k_p, v_p, q_t, k_t, v_t, target = make_qkv_tangents_target(dtype)
     mask = make_attn_mask(mask_kind, dtype)
@@ -154,31 +160,19 @@ def test_fwd_dual_matches_sdpa(dtype: torch.dtype, mask_kind: str | None, causal
         q, k, v = make_duals(
             q_p.clone(), q_t.clone(), k_p.clone(), k_t.clone(), v_p.clone(), v_t.clone()
         )
-        out = JVPAttn.fwd_dual(q, k, v, attn_mask=mask, causal=causal)
+        out = JVPAttn.fwd_dual(q, k, v, attn_mask=mask, causal=causal, USE_NAIVE=True)
         o_p, o_t = fwAD.unpack_dual(out)
         ((o_p - target) ** 2).mean().backward()
-
     assert_close_metrics((o_p, o_t, q.grad, k.grad, v.grad), expected, dtype)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("mask_kind,causal", MASK_CASES)
-def test_torch_func_jvp_matches_sdpa(dtype: torch.dtype, mask_kind: str | None, causal: bool) -> None:
-    """The naive forward under `torch.func.jvp` matches SDPA's primal, tangent, and gradients."""
-
-    q_p, k_p, v_p, q_t, k_t, v_t, target = make_qkv_tangents_target(dtype)
-    mask = make_attn_mask(mask_kind, dtype)
-    expected = sdpa_dual_reference(q_p, k_p, v_p, q_t, k_t, v_t, target, mask, causal)
 
     primals = tuple(t.clone().requires_grad_() for t in (q_p, k_p, v_p))
     with enable_grad():
         o_p, o_t = torch.func.jvp(
-            partial(JVPAttn.fwd_dual, attn_mask=mask, causal=causal),
+            partial(JVPAttn.fwd_dual, attn_mask=mask, causal=causal, USE_NAIVE=True),
             primals,
             (q_t, k_t, v_t),
         )
         ((o_p - target) ** 2).mean().backward()
-
     assert_close_metrics((o_p, o_t, *[t.grad for t in primals]), expected, dtype)
 
 
@@ -186,10 +180,12 @@ def test_fwd_dual_with_plain_inputs() -> None:
     """`fwd_dual` accepts plain tensors and returns a plain tensor."""
 
     q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
-    out = JVPAttn.fwd_dual(q_p, k_p, v_p)
+    out = JVPAttn.fwd_dual(q_p, k_p, v_p, USE_NAIVE=True)
     with fwAD.dual_level():
         assert fwAD.unpack_dual(out)[1] is None
-    torch.testing.assert_close(out, JVPAttn.fwd(q_p, k_p, v_p), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        out, JVPAttn.fwd(q_p, k_p, v_p, USE_NAIVE=True), atol=1e-6, rtol=1e-6
+    )
 
 
 def test_apply_interface() -> None:
@@ -205,9 +201,7 @@ def test_apply_interface() -> None:
     torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
 
     out, ctx = JVPAttn.apply(q_p, k_p, v_p, q_t, k_t, v_t, *args)
-    _, expected_tangent = torch.func.jvp(
-        JVPAttn.fwd_dual, (q_p, k_p, v_p), (q_t, k_t, v_t)
-    )
+    _, expected_tangent = torch.func.jvp(JVPAttn.fwd_dual, (q_p, k_p, v_p), (q_t, k_t, v_t))
     torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(ctx[0], expected_tangent, atol=1e-6, rtol=1e-6)
 
@@ -264,7 +258,7 @@ def test_arbitrary_seq_lens(
         q, k, v = make_duals(
             q_p.clone(), q_t.clone(), k_p.clone(), k_t.clone(), v_p.clone(), v_t.clone()
         )
-        out = JVPAttn.fwd_dual(q, k, v, attn_mask=mask, causal=causal)
+        out = JVPAttn.fwd_dual(q, k, v, attn_mask=mask, causal=causal, USE_NAIVE=True)
         o_p, o_t = fwAD.unpack_dual(out)
         ((o_p - target) ** 2).mean().backward()
     assert_close_metrics((o_p, o_t, q.grad, k.grad, v.grad), expected, dtype)
@@ -272,16 +266,36 @@ def test_arbitrary_seq_lens(
     # explicit (possibly non-dividing) buckets, through the pure-PyTorch pass
     mask_tensor, MASK_TYPE = prepare_attn_mask(mask, q_p)
     o, o_t, lse = tiled_attention(
-        q_p, k_p, v_p, mask_tensor, MASK_TYPE, causal, D**-0.5, q_t, k_t, v_t,
-        q_bucket_size=q_bucket_size, k_bucket_size=k_bucket_size,
+        q_p,
+        k_p,
+        v_p,
+        mask_tensor,
+        MASK_TYPE,
+        causal,
+        D**-0.5,
+        q_t,
+        k_t,
+        v_t,
+        q_bucket_size=q_bucket_size,
+        k_bucket_size=k_bucket_size,
     )
     torch.testing.assert_close(o, expected[0], atol=ATOL[dtype], rtol=RTOL)
     torch.testing.assert_close(o_t, expected[1], atol=ATOL[dtype], rtol=RTOL)
 
     do = 2 * (o - target) / o.numel()
     dq, dk, dv = tiled_attention_backward(
-        q_p, k_p, v_p, o, do, lse, mask_tensor, MASK_TYPE, causal, D**-0.5,
-        q_bucket_size=q_bucket_size, k_bucket_size=k_bucket_size,
+        q_p,
+        k_p,
+        v_p,
+        o,
+        do,
+        lse,
+        mask_tensor,
+        MASK_TYPE,
+        causal,
+        D**-0.5,
+        q_bucket_size=q_bucket_size,
+        k_bucket_size=k_bucket_size,
     )
     assert_close_metrics((dq, dk, dv), expected[2:5], dtype)
 
@@ -324,74 +338,59 @@ def test_cpu_dispatch() -> None:
         torch.testing.assert_close(out, o_p, atol=1e-6, rtol=1e-6)
 
 
-def test_causal_mask_rejected() -> None:
-    """Causal attention rejects an attention mask."""
-
-    q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
-    with pytest.raises(ValueError, match="Causal attention does not support an attention mask"):
-        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=torch.ones(Z, H, N, N, dtype=torch.bool), causal=True)
-
-
-def test_dropout_rejected() -> None:
-    """Dropout remains unsupported."""
+def test_unsupported_options() -> None:
+    """Dropout is unsupported, and causal attention rejects a mask."""
 
     q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
     with pytest.raises(NotImplementedError, match="Dropout is not currently supported"):
         JVPAttn.fwd(q_p, k_p, v_p, dropout_p=0.1)
+    with pytest.raises(ValueError, match="Causal attention does not support an attention mask"):
+        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=torch.ones(Z, H, N, N, dtype=torch.bool), causal=True)
 
 
-def test_all_false_head_rejected() -> None:
-    """A boolean mask must leave at least one position per head."""
+def test_invalid_masks_rejected() -> None:
+    """Invalid masks are rejected, and additive masks without the constant warn."""
 
     q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
+
     mask = make_attn_mask("boolean", torch.float32)
     mask[0, 0] = False
     with pytest.raises(AssertionError, match="cannot be all False"):
         JVPAttn.fwd(q_p, k_p, v_p, attn_mask=mask)
 
+    for message, value in (
+        ("cannot contain NaNs", float("nan")),
+        ("cannot contain -inf or inf", float("inf")),
+    ):
+        mask = make_attn_mask("additive", torch.float32)
+        mask[0, 0, 0, 0] = value
+        with pytest.raises(AssertionError, match=message):
+            JVPAttn.fwd(q_p, k_p, v_p, attn_mask=mask)
 
-def test_invalid_additive_mask_rejected() -> None:
-    """Additive masks cannot contain NaN/inf or be all-masked for any head."""
-
-    q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
-
-    nan_mask = make_attn_mask("additive", torch.float32)
-    nan_mask[0, 0, 0, 0] = float("nan")
-    with pytest.raises(AssertionError, match="cannot contain NaNs"):
-        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=nan_mask)
-
-    inf_mask = make_attn_mask("additive", torch.float32)
-    inf_mask[0, 0, 0, 0] = float("inf")
-    with pytest.raises(AssertionError, match="cannot contain -inf or inf"):
-        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=inf_mask)
-
-    all_masked = make_attn_mask("additive", torch.float32)
-    all_masked[0, 0] = MASK_CONST
+    mask = make_attn_mask("additive", torch.float32)
+    mask[0, 0] = MASK_CONST
     with pytest.raises(AssertionError, match="cannot be all"):
-        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=all_masked)
-
-
-def test_additive_mask_warning() -> None:
-    """An additive mask without the masking constant warns."""
-
-    q_p, k_p, v_p, *_ = make_qkv_tangents_target(torch.float32)
-    mask = torch.zeros(Z, H, N, N, dtype=torch.float32, device=DEVICE)
-    with pytest.raises(UserWarning, match="does not mask out any elements"):
         JVPAttn.fwd(q_p, k_p, v_p, attn_mask=mask)
 
+    zeros = torch.zeros(Z, H, N, N, dtype=torch.float32, device=DEVICE)
+    with pytest.raises(UserWarning, match="does not mask out any elements"):
+        JVPAttn.fwd(q_p, k_p, v_p, attn_mask=zeros)
+
     # NOTE: The warning can be skipped entirely by disabling mask verification
-    out = JVPAttn.fwd(q_p, k_p, v_p, attn_mask=mask, verify_attn_mask=False)
+    out = JVPAttn.fwd(q_p, k_p, v_p, attn_mask=zeros, verify_attn_mask=False)
     assert out.shape == (Z, H, N, D)
 
 
 @pytest.mark.skipif(
     not (HAS_TRITON and torch.cuda.is_available()), reason="requires Triton on a CUDA device"
 )
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("mask_kind,causal", MASK_CASES)
-def test_naive_matches_triton_kernel(mask_kind: str | None, causal: bool) -> None:
+def test_naive_matches_triton_kernel(
+    dtype: torch.dtype, mask_kind: str | None, causal: bool
+) -> None:
     """The naive implementation matches the Triton kernel's outputs and gradients."""
 
-    dtype = torch.float32
     q_p, k_p, v_p, q_t, k_t, v_t, target = make_qkv_tangents_target(dtype)
     mask = make_attn_mask(mask_kind, dtype)
 
@@ -413,4 +412,83 @@ def test_naive_matches_triton_kernel(mask_kind: str | None, causal: bool) -> Non
         ((o_p - target) ** 2).mean().backward()
         naive = (o_p.detach(), o_t.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach())
 
-    assert_close_metrics(naive, triton, dtype)
+    # NOTE: The naive path computes in fp32 while the kernel uses bf16 tensor cores,
+    # so the two implementations agree only to within a few bf16 ulps.
+    assert_close_metrics(naive, triton, dtype, atol=5e-2 if dtype is torch.bfloat16 else None)
+
+
+@pytest.mark.parametrize("use_naive", [True, False])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_sequential_matches_parallel(dtype: torch.dtype, use_naive: bool) -> None:
+    """One token at a time (with a growing context) matches parallel causal attention."""
+
+    if not use_naive and not (HAS_TRITON and torch.cuda.is_available()):
+        pytest.skip("requires Triton on a CUDA device")
+
+    q_p, k_p, v_p, q_t, k_t, v_t, _ = make_qkv_tangents_target(dtype, 64)
+
+    with fwAD.dual_level():
+        parallel = JVPAttn.fwd_dual(
+            *make_duals(
+                q_p.clone(), q_t.clone(), k_p.clone(), k_t.clone(), v_p.clone(), v_t.clone()
+            ),
+            causal=True,
+            USE_NAIVE=use_naive,
+        )
+        parallel_p, parallel_t = fwAD.unpack_dual(parallel)
+
+        seq_p, seq_t = [], []
+        for i in range(64):
+            step = JVPAttn.fwd_dual(
+                *make_duals(
+                    q_p[..., i : i + 1, :].clone(),
+                    q_t[..., i : i + 1, :].clone(),
+                    k_p[..., : i + 1, :].clone(),
+                    k_t[..., : i + 1, :].clone(),
+                    v_p[..., : i + 1, :].clone(),
+                    v_t[..., : i + 1, :].clone(),
+                ),
+                causal=True,
+                USE_NAIVE=use_naive,
+            )
+            step_p, step_t = fwAD.unpack_dual(step)
+            seq_p.append(step_p)
+            seq_t.append(step_t)
+
+    seq_p = torch.cat(seq_p, dim=-2)
+    seq_t = torch.cat(seq_t, dim=-2)
+    torch.testing.assert_close(seq_p, parallel_p, atol=ATOL[dtype], rtol=RTOL)
+    # NOTE: The JVP tangent accumulates extra rounding in bf16 tensor cores along
+    # the padded pathway, so it is compared with a looser tolerance.
+    torch.testing.assert_close(
+        seq_t, parallel_t, atol=5e-2 if dtype is torch.bfloat16 else ATOL[dtype], rtol=RTOL
+    )
+
+
+@pytest.mark.skipif(
+    not (HAS_TRITON and torch.cuda.is_available()), reason="requires Triton on a CUDA device"
+)
+@pytest.mark.parametrize("n_ctx", [1, 17, 33])
+@pytest.mark.parametrize("mask_kind,causal", MASK_CASES)
+def test_short_sequences_match_sdpa(n_ctx: int, mask_kind: str | None, causal: bool) -> None:
+    """Short (padded-and-excised) sequences match SDPA's outputs and gradients."""
+
+    if n_ctx == 1 and mask_kind == "additive":
+        pytest.skip("a 1x1 additive mask cannot contain MASK_CONST and still be valid")
+
+    dtype = torch.float32
+    q_p, k_p, v_p, *_ = make_qkv_tangents_target(dtype, n_ctx)
+    mask = make_attn_mask(mask_kind, dtype, n_ctx)
+
+    with sdpa_kernel(SDPBackend.MATH), enable_grad():
+        q_ref, k_ref, v_ref = (t.clone().requires_grad_() for t in (q_p, k_p, v_p))
+        ref = scaled_dot_product_attention(q_ref, k_ref, v_ref, attn_mask=mask, is_causal=causal)
+        ref.sum().backward()
+
+    q, k, v = (t.clone().requires_grad_() for t in (q_p, k_p, v_p))
+    out = JVPAttn.fwd(q, k, v, attn_mask=mask, causal=causal, USE_NAIVE=False)
+    out.sum().backward()
+
+    assert_close_metrics(
+        (out, q.grad, k.grad, v.grad), (ref, q_ref.grad, k_ref.grad, v_ref.grad), dtype
+    )
